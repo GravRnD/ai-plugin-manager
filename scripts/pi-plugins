@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Keep a shared Git checkout of a plugin collection and enable packages per Pi project."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+PLUGIN_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+SCP_SOURCE = re.compile(r"(?:[\w.-]+@)?[\w.-]+:[^:\s][^\s]*")
+
+
+def xdg_home(variable, fallback):
+    home = Path(os.environ.get(variable, ""))
+    return home if home.is_absolute() else Path.home() / fallback
+
+
+def checkout_path(source):
+    data_home = xdg_home("XDG_DATA_HOME", ".local/share")
+    key = hashlib.sha256(source.encode()).hexdigest()
+    return data_home / "pi-plugins" / "git" / key
+
+
+def sources_dir():
+    return xdg_home("XDG_CONFIG_HOME", ".config") / "pi-plugins" / "sources"
+
+
+def sources():
+    return {p.name: p.read_text(encoding="utf-8").strip() for p in sorted(sources_dir().glob("*"))
+            if PLUGIN_NAME.fullmatch(p.name) and p.is_file()}
+
+
+def valid_source(source):
+    return (not source.startswith("-") and not any(ord(c) < 32 for c in source)
+            and (re.fullmatch(r"(?:https|ssh)://[^\s]+", source) or SCP_SOURCE.fullmatch(source)
+                 or Path(source).is_absolute()))
+
+
+def has_checkout(checkout):
+    return not checkout.is_symlink() and (checkout / ".git").is_dir()
+
+
+def run(*args):
+    subprocess.run(args, check=True)
+
+
+def ensure_checkout(source, checkout):
+    if not has_checkout(checkout):
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".clone-", dir=checkout.parent) as tmp:
+            staging = Path(tmp) / "checkout"
+            run("git", "clone", "--", source, str(staging))
+            try:
+                staging.rename(checkout)
+            except OSError:
+                if not has_checkout(checkout):
+                    raise
+
+
+def plugin_path(checkout, name):
+    plugin = checkout / name
+    manifest = plugin / "package.json"
+    if plugin.is_symlink() or manifest.is_symlink() or not manifest.is_file():
+        raise ValueError(f"В этой поставке нет Pi-пакета {name!r}.")
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("pi"), dict):
+        raise ValueError(f"У пакета {name!r} нет манифеста Pi.")
+    return plugin
+
+
+def catalog(source, checkout):
+    ensure_checkout(source, checkout)
+    plugins = []
+    for path in sorted(checkout.iterdir()):
+        # The manager is a global bootstrap package, not a project plugin.
+        if path.name != "plugin-manager" and PLUGIN_NAME.fullmatch(path.name):
+            try:
+                plugin_path(checkout, path.name)
+            except ValueError:
+                continue
+            plugins.append(path.name)
+    return {"checkout": str(checkout), "plugins": plugins}
+
+
+def add_source(alias, source, checkout):
+    folder = sources_dir()
+    target = folder / alias
+    if target.exists() and target.read_text(encoding="utf-8").strip() != source:
+        raise ValueError(f"Имя источника {alias!r} уже занято.")
+    if not catalog(source, checkout)["plugins"]:
+        raise ValueError("В источнике не найдены Pi-пакеты в отдельных каталогах.")
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".source-", dir=folder) as tmp:
+        staged = Path(tmp) / alias
+        staged.write_text(source + "\n", encoding="utf-8")
+        try:
+            os.link(staged, target)
+        except FileExistsError:
+            if target.read_text(encoding="utf-8").strip() != source:
+                raise ValueError(f"Имя источника {alias!r} уже занято.") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("sources", help="показать сохранённые Git-источники (JSON)")
+    for action, help_text in (
+        ("install", "скачать поставку при необходимости и подключить плагин здесь"),
+        ("remove", "отключить плагин здесь, не удаляя общую копию"),
+        ("update", "обновить общую копию поставки для всех проектов"),
+        ("source-add", "скачать и сохранить Git-источник под именем"),
+        ("catalog", "показать доступные Pi-пакеты в источнике (JSON)"),
+    ):
+        command = commands.add_parser(action, help=help_text)
+        command.add_argument("--source", default=os.environ.get("PI_PLUGINS_SOURCE"),
+                             help="Git-адрес поставки (по умолчанию $PI_PLUGINS_SOURCE)")
+        if action == "source-add":
+            command.add_argument("alias", help="имя источника в меню /plugin")
+        if action in {"install", "remove"}:
+            command.add_argument("plugin", help="имя каталога плагина в поставке")
+            command.add_argument("--approve", action="store_true",
+                                 help="передать Pi разрешение доверять проекту на эту команду")
+    args = parser.parse_args()
+    if args.command != "sources" and (not args.source or not valid_source(args.source)):
+        parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
+    if args.command in {"install", "remove"} and not PLUGIN_NAME.fullmatch(args.plugin):
+        parser.error("недопустимое имя плагина")
+    if args.command == "source-add" and not PLUGIN_NAME.fullmatch(args.alias):
+        parser.error("имя источника: строчные латинские буквы, цифры и дефисы")
+
+    try:
+        if args.command == "sources":
+            print(json.dumps(sources()))
+            return 0
+        source = args.source
+        checkout = checkout_path(source)
+        if args.command == "source-add":
+            add_source(args.alias, source, checkout)
+        elif args.command == "catalog":
+            print(json.dumps(catalog(source, checkout)))
+        elif args.command == "update":
+            if not has_checkout(checkout):
+                raise ValueError("Поставка ещё не скачана. Сначала добавьте источник или установите плагин.")
+            run("git", "-C", str(checkout), "pull", "--ff-only")
+        else:
+            if args.command == "install":
+                ensure_checkout(source, checkout)
+                plugin = plugin_path(checkout, args.plugin)
+            else:
+                plugin = checkout / args.plugin
+            options = ["--approve"] if args.approve else []
+            run("pi", args.command, "-l", str(plugin), *options)
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"pi-plugins: {error}\n")
+    except subprocess.CalledProcessError as error:
+        return error.returncode if error.returncode > 0 else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
