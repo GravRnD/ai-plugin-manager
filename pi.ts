@@ -5,11 +5,16 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("./scripts/pi-plugins", import.meta.url));
+const extensionPath = fileURLToPath(import.meta.url);
 const actions = {
   add: "Добавить Git-источник",
-  plugins: "Плагины текущего проекта",
+  list: "Плагины текущего проекта",
   update: "Обновить Git-источник",
+  commands: "Команды подключённых пакетов",
+  help: "Справка по /plugin",
 };
+type Action = keyof typeof actions;
+const actionNames = Object.keys(actions) as Action[];
 
 type Catalog = { checkout: string; plugins: string[] };
 
@@ -49,37 +54,74 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("plugin", {
-    description: "Git-источники плагинов: добавить, обновить, подключить к текущему проекту",
-    handler: async (_args, ctx) => {
+    description: "Меню плагинов Pi · add, list, update, commands, help",
+    getArgumentCompletions: (prefix) => {
+      const matches = actionNames.filter((name) => name.startsWith(prefix.trimStart().toLowerCase()));
+      return matches.length ? matches.map((name) => ({ value: name, label: name, description: actions[name] })) : null;
+    },
+    handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
       if (!ctx.isIdle()) {
         ctx.ui.notify("Дождитесь окончания текущего запроса, затем откройте /plugin.", "warning");
         return;
       }
       try {
-        const sources: Record<string, string> = JSON.parse(await run(ctx, "sources"));
+        const requested = args.trim().toLowerCase();
+        let action = actionNames.find((name) => name === requested);
+        if (requested && !action) {
+          ctx.ui.notify(`Неизвестное действие: ${args.trim()}. Список: /plugin help.`, "warning");
+          return;
+        }
+        // Help and command discovery use the current session, not the Git catalog.
+        const sources: Record<string, string> = action === "help" || action === "commands" ? {} : JSON.parse(await run(ctx, "sources"));
         const aliases = Object.keys(sources).sort();
-        const action = await ctx.ui.select("Плагины Pi", aliases.length ? [actions.plugins, actions.update, actions.add] : [actions.add]);
-        if (!action) return;
-        if (action === actions.add) {
+        if (!action) {
+          const menu: Action[] = aliases.length ? ["list", "update", "add", "commands", "help"] : ["add", "commands", "help"];
+          const selected = await ctx.ui.select("Плагины Pi", menu.map((name) => actions[name]));
+          action = menu.find((name) => actions[name] === selected);
+          if (!action) return;
+        }
+        if (action === "help") {
+          ctx.ui.notify(["/plugin — открыть меню", ...actionNames.map((name) => `/plugin ${name} — ${actions[name]}`)].join("\n"), "info");
+          return;
+        }
+        if (action === "commands") {
+          const items = pi.getCommands()
+            .filter((command) => command.sourceInfo.origin === "package" && command.sourceInfo.path !== extensionPath)
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((command) => [command.description ? `/${command.name} — ${command.description}` : `/${command.name}`, `/${command.name}`] as const);
+          if (!items.length) {
+            ctx.ui.notify("В текущей сессии нет команд от подключённых пакетов.", "info");
+            return;
+          }
+          const selected = await ctx.ui.select(actions.commands, items.map(([label]) => label));
+          const command = items.find(([label]) => label === selected)?.[1];
+          if (command) ctx.ui.setEditorText(`${command} `);
+          return;
+        }
+        if (action === "add") {
           const url = (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
           if (!url) return;
           const name = (await ctx.ui.input("Короткое имя источника", "team-tools"))?.trim();
           if (!name) return;
           ctx.ui.notify(`Скачиваю источник ${name}…`, "info");
           await run(ctx, "source-add", name, "--source", url);
-          ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin → «${actions.plugins}».`, "info");
+          ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin list, чтобы выбрать плагины.`, "info");
           return;
         }
 
-        if (action === actions.plugins && !ctx.isProjectTrusted()) {
+        if (!aliases.length) {
+          ctx.ui.notify("Нет Git-источников. Добавьте первый через /plugin add.", "info");
+          return;
+        }
+        if (action === "list" && !ctx.isProjectTrusted()) {
           ctx.ui.notify("Чтобы изменить плагины проекта, сначала разрешите его настройки через /trust.", "warning");
           return;
         }
         const alias = aliases.length === 1 ? aliases[0] : await ctx.ui.select("Выберите Git-источник", aliases);
         if (!alias) return;
         const sourceArgs = ["--source", sources[alias]];
-        if (action === actions.update) {
+        if (action === "update") {
           ctx.ui.notify(`Обновляю ${alias}…`, "info");
           await run(ctx, "update", ...sourceArgs);
           ctx.ui.notify(`${alias} обновлён. В других открытых проектах используйте /reload.`, "info");
