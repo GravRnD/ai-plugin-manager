@@ -17,12 +17,7 @@ type Action = keyof typeof actions;
 const actionNames = Object.keys(actions) as Action[];
 const addUsage = "/plugin add [Git-адрес] [имя]";
 
-function sourceName(url: string): string {
-  return (url.replace(/\/+$/, "").split(/[/:]/).pop() ?? "").replace(/\.git$/i, "")
-    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-}
-
-type Catalog = { checkout: string; plugins: string[] };
+type Catalog = { checkout: string; plugins: string[]; rootPlugin?: string };
 
 async function connectedPlugins(cwd: string, checkout: string): Promise<Set<string>> {
   const folder = join(cwd, CONFIG_DIR_NAME);
@@ -41,7 +36,9 @@ async function connectedPlugins(cwd: string, checkout: string): Promise<Set<stri
     const source = typeof entry === "string" ? entry : entry?.source;
     if (typeof source !== "string") continue;
     const path = source.startsWith("~/") ? resolve(homedir(), source.slice(2)) : resolve(folder, source);
-    if (dirname(path) === root && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(basename(path))) {
+    if (path === root) {
+      names.add(".");
+    } else if (dirname(path) === root && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(basename(path))) {
       names.add(basename(path));
     }
   }
@@ -115,12 +112,9 @@ export default function (pi: ExtensionAPI) {
         if (action === "add") {
           const input = params[0] ?? (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
           if (!input) return;
-          const url = input.replace(/^git:(?=(?:https|ssh):\/\/)/, "");
-          const name = (params[0] ? params[1] ?? sourceName(url) : "") ||
-            (await ctx.ui.input("Короткое имя источника", "team-tools"))?.trim();
-          if (!name) return;
-          ctx.ui.notify(`Скачиваю источник ${name}…`, "info");
-          await run(ctx, "source-add", name, "--source", url);
+          ctx.ui.notify("Скачиваю Git-источник…", "info");
+          const alias = params[1] ? ["--", params[1]] : [];
+          const name = (await run(ctx, "source-add", `--source=${input}`, ...alias)).trim();
           ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin list, чтобы выбрать плагины.`, "info");
           return;
         }
@@ -144,16 +138,18 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const { checkout, plugins }: Catalog = JSON.parse(await run(ctx, "catalog", ...sourceArgs));
+        const { checkout, plugins, rootPlugin }: Catalog = JSON.parse(await run(ctx, "catalog", ...sourceArgs));
         const connected = await connectedPlugins(ctx.cwd, checkout);
         const available = new Set(plugins);
-        const names = [...new Set([...plugins, ...connected])].sort();
+        if (rootPlugin) available.add(".");
+        const names = [...new Set([...available, ...connected])].sort();
+        const label = (name: string) => name === "." ? rootPlugin ?? "корневой пакет" : name;
         if (names.length === 0) {
           ctx.ui.notify(`В ${alias} нет плагинов.`, "info");
           return;
         }
         const options = new Map(names.map((name) => [
-          `${name} — ${connected.has(name) ? (available.has(name) ? "подключён" : "подключён, убран из поставки") : "доступен"}`,
+          `${label(name)} — ${connected.has(name) ? (available.has(name) ? "подключён" : "подключён, убран из поставки") : "доступен"}`,
           name,
         ]));
         const choice = await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}`, [...options.keys()]);
@@ -161,13 +157,13 @@ export default function (pi: ExtensionAPI) {
         if (!plugin) return;
         const removing = connected.has(plugin);
         const confirmed = await ctx.ui.confirm(
-          removing ? `Отключить ${plugin}?` : `Подключить ${plugin}?`,
+          removing ? `Отключить ${label(plugin)}?` : `Подключить ${label(plugin)}?`,
           removing ? "Только для текущего проекта." : "Только для текущего проекта. Расширения запускаются с правами Pi.",
         );
         if (!confirmed) return;
         // The child CLI does not inherit the active session's project-trust decision.
         await run(ctx, removing ? "remove" : "install", plugin, ...sourceArgs, "--approve");
-        ctx.ui.notify(`${plugin}: ${removing ? "отключён" : "подключён"} в текущем проекте.`, "info");
+        ctx.ui.notify(`${label(plugin)}: ${removing ? "отключён" : "подключён"} в текущем проекте.`, "info");
         await ctx.reload();
       } catch (error) {
         ctx.ui.notify(`/plugin: ${error instanceof Error ? error.message : String(error)}`, "error");

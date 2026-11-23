@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -42,6 +43,20 @@ def valid_source(source):
                  or Path(source).is_absolute()))
 
 
+def normalize_source(source):
+    if source.startswith(("git:https://", "git:ssh://")):
+        return source[4:]
+    if re.match(r"git:[\w.-]+\.[\w.-]+/", source):
+        return "https://" + source[4:]
+    return source
+
+
+def inferred_alias(source):
+    name = re.split(r"[/:]", source.rstrip("/"))[-1]
+    name = re.sub(r"\.git$", "", name, flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "source"
+
+
 def has_checkout(checkout):
     return not checkout.is_symlink() and (checkout / ".git").is_dir()
 
@@ -63,14 +78,19 @@ def ensure_checkout(source, checkout):
                     raise
 
 
-def plugin_path(checkout, name):
-    plugin = checkout / name
+def pi_metadata(plugin):
     manifest = plugin / "package.json"
     if plugin.is_symlink() or manifest.is_symlink() or not manifest.is_file():
-        raise ValueError(f"В этой поставке нет Pi-пакета {name!r}.")
+        raise ValueError(f"В этой поставке нет Pi-пакета {plugin.name!r}.")
     metadata = json.loads(manifest.read_text(encoding="utf-8"))
     if not isinstance(metadata, dict) or not isinstance(metadata.get("pi"), dict):
-        raise ValueError(f"У пакета {name!r} нет манифеста Pi.")
+        raise ValueError("У пакета нет манифеста Pi.")
+    return metadata
+
+
+def plugin_path(checkout, name):
+    plugin = checkout / name
+    pi_metadata(plugin)
     return plugin
 
 
@@ -85,25 +105,45 @@ def catalog(source, checkout):
             except ValueError:
                 continue
             plugins.append(path.name)
-    return {"checkout": str(checkout), "plugins": plugins}
+    result = {"checkout": str(checkout), "plugins": plugins}
+    if not plugins:
+        try:
+            name = pi_metadata(checkout).get("name")
+        except ValueError:
+            pass
+        else:
+            result["rootPlugin"] = name if isinstance(name, str) and name.strip() else "корневой пакет"
+    return result
 
 
 def add_source(alias, source, checkout):
-    folder = sources_dir()
-    target = folder / alias
-    if target.exists() and target.read_text(encoding="utf-8").strip() != source:
+    registered = sources()
+    if alias and alias in registered and registered[alias] != source:
         raise ValueError(f"Имя источника {alias!r} уже занято.")
-    if not catalog(source, checkout)["plugins"]:
-        raise ValueError("В источнике не найдены Pi-пакеты в отдельных каталогах.")
+    if not alias:
+        existing = next((name for name, address in registered.items() if address == source), None)
+        if existing:
+            return existing
+    available = catalog(source, checkout)
+    if not available["plugins"] and not available.get("rootPlugin"):
+        raise ValueError("В источнике не найдены Pi-пакеты. Нужен package.json с секцией pi в корне или в каталогах плагинов.")
+    folder = sources_dir()
     folder.mkdir(parents=True, exist_ok=True)
+    base = alias or inferred_alias(source)
     with tempfile.TemporaryDirectory(prefix=".source-", dir=folder) as tmp:
-        staged = Path(tmp) / alias
+        staged = Path(tmp) / "address"
         staged.write_text(source + "\n", encoding="utf-8")
-        try:
-            os.link(staged, target)
-        except FileExistsError:
-            if target.read_text(encoding="utf-8").strip() != source:
-                raise ValueError(f"Имя источника {alias!r} уже занято.") from None
+        for index in itertools.count(1):
+            name = base if index == 1 else f"{base}-{index}"
+            target = folder / name
+            try:
+                os.link(staged, target)
+            except FileExistsError:
+                if target.read_text(encoding="utf-8").strip() != source:
+                    if alias:
+                        raise ValueError(f"Имя источника {alias!r} уже занято.") from None
+                    continue
+            return name
 
 
 def main():
@@ -121,17 +161,19 @@ def main():
         command.add_argument("--source", default=os.environ.get("PI_PLUGINS_SOURCE"),
                              help="Git-адрес поставки (по умолчанию $PI_PLUGINS_SOURCE)")
         if action == "source-add":
-            command.add_argument("alias", help="имя источника в меню /plugin")
+            command.add_argument("alias", nargs="?", help="необязательное имя источника в меню /plugin")
         if action in {"install", "remove"}:
-            command.add_argument("plugin", help="имя каталога плагина в поставке")
+            command.add_argument("plugin", help="имя каталога плагина в поставке или . для корневого пакета")
             command.add_argument("--approve", action="store_true",
                                  help="передать Pi разрешение доверять проекту на эту команду")
     args = parser.parse_args()
-    if args.command != "sources" and (not args.source or not valid_source(args.source)):
-        parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
-    if args.command in {"install", "remove"} and not PLUGIN_NAME.fullmatch(args.plugin):
+    if args.command != "sources":
+        args.source = normalize_source(args.source or "")
+        if not valid_source(args.source):
+            parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
+    if args.command in {"install", "remove"} and args.plugin != "." and not PLUGIN_NAME.fullmatch(args.plugin):
         parser.error("недопустимое имя плагина")
-    if args.command == "source-add" and not PLUGIN_NAME.fullmatch(args.alias):
+    if args.command == "source-add" and args.alias is not None and not PLUGIN_NAME.fullmatch(args.alias):
         parser.error("имя источника: строчные латинские буквы, цифры и дефисы")
 
     try:
@@ -141,7 +183,7 @@ def main():
         source = args.source
         checkout = checkout_path(source)
         if args.command == "source-add":
-            add_source(args.alias, source, checkout)
+            print(add_source(args.alias, source, checkout))
         elif args.command == "catalog":
             print(json.dumps(catalog(source, checkout)))
         elif args.command == "update":
