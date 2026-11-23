@@ -15,6 +15,12 @@ const actions = {
 };
 type Action = keyof typeof actions;
 const actionNames = Object.keys(actions) as Action[];
+const addUsage = "/plugin add [Git-адрес] [имя]";
+
+function sourceName(url: string): string {
+  return (url.replace(/\/+$/, "").split(/[/:]/).pop() ?? "").replace(/\.git$/i, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
 
 type Catalog = { checkout: string; plugins: string[] };
 
@@ -57,7 +63,9 @@ export default function (pi: ExtensionAPI) {
     description: "Меню плагинов Pi · add, list, update, commands, help",
     getArgumentCompletions: (prefix) => {
       const matches = actionNames.filter((name) => name.startsWith(prefix.trimStart().toLowerCase()));
-      return matches.length ? matches.map((name) => ({ value: name, label: name, description: actions[name] })) : null;
+      return matches.length ? matches.map((name) => ({
+        value: name, label: name, description: name === "add" ? `${actions.add} · [Git-адрес] [имя]` : actions[name],
+      })) : null;
     },
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
@@ -66,10 +74,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       try {
-        const requested = args.trim().toLowerCase();
-        let action = actionNames.find((name) => name === requested);
+        const [requested, ...params] = args.trim().split(/\s+/);
+        let action = actionNames.find((name) => name === requested.toLowerCase());
         if (requested && !action) {
-          ctx.ui.notify(`Неизвестное действие: ${args.trim()}. Список: /plugin help.`, "warning");
+          ctx.ui.notify(`Неизвестное действие: ${requested}. Список: /plugin help.`, "warning");
+          return;
+        }
+        if (action === "add" ? params.length > 2 : params.length > 0) {
+          ctx.ui.notify(`Использование: ${action === "add" ? addUsage : `/plugin ${action}`}`, "warning");
           return;
         }
         // Help and command discovery use the current session, not the Git catalog.
@@ -82,7 +94,8 @@ export default function (pi: ExtensionAPI) {
           if (!action) return;
         }
         if (action === "help") {
-          ctx.ui.notify(["/plugin — открыть меню", ...actionNames.map((name) => `/plugin ${name} — ${actions[name]}`)].join("\n"), "info");
+          ctx.ui.notify(["/plugin — открыть меню", ...actionNames.map((name) =>
+            `${name === "add" ? addUsage : `/plugin ${name}`} — ${actions[name]}`)].join("\n"), "info");
           return;
         }
         if (action === "commands") {
@@ -100,9 +113,11 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (action === "add") {
-          const url = (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
-          if (!url) return;
-          const name = (await ctx.ui.input("Короткое имя источника", "team-tools"))?.trim();
+          const input = params[0] ?? (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
+          if (!input) return;
+          const url = input.replace(/^git:(?=(?:https|ssh):\/\/)/, "");
+          const name = (params[0] ? params[1] ?? sourceName(url) : "") ||
+            (await ctx.ui.input("Короткое имя источника", "team-tools"))?.trim();
           if (!name) return;
           ctx.ui.notify(`Скачиваю источник ${name}…`, "info");
           await run(ctx, "source-add", name, "--source", url);
