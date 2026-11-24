@@ -8,7 +8,9 @@ const script = fileURLToPath(new URL("./scripts/pi-plugins", import.meta.url));
 const extensionPath = fileURLToPath(import.meta.url);
 const actions = {
   add: "Добавить Git-источник",
-  list: "Плагины текущего проекта",
+  personal: "Личные плагины проекта (вне репозитория)",
+  list: "Плагины проекта (.pi/settings.json)",
+  launcher: "Подключить запуск pi-with-plugins",
   update: "Обновить Git-источник",
   commands: "Команды подключённых пакетов",
   help: "Справка по /plugin",
@@ -57,7 +59,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("plugin", {
-    description: "Меню плагинов Pi · add, list, update, commands, help",
+    description: "Меню плагинов Pi · add, personal, list, launcher, update, commands, help",
     getArgumentCompletions: (prefix) => {
       const matches = actionNames.filter((name) => name.startsWith(prefix.trimStart().toLowerCase()));
       return matches.length ? matches.map((name) => ({
@@ -82,10 +84,13 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         // Help and command discovery use the current session, not the Git catalog.
-        const sources: Record<string, string> = action === "help" || action === "commands" ? {} : JSON.parse(await run(ctx, "sources"));
+        const sources: Record<string, string> = action === "help" || action === "commands" || action === "launcher"
+          ? {} : JSON.parse(await run(ctx, "sources"));
         const aliases = Object.keys(sources).sort();
         if (!action) {
-          const menu: Action[] = aliases.length ? ["list", "update", "add", "commands", "help"] : ["add", "commands", "help"];
+          const menu: Action[] = aliases.length
+            ? ["personal", "update", "add", "commands", "launcher", "list", "help"]
+            : ["add", "commands", "launcher", "help"];
           const selected = await ctx.ui.select("Плагины Pi", menu.map((name) => actions[name]));
           action = menu.find((name) => actions[name] === selected);
           if (!action) return;
@@ -109,13 +114,18 @@ export default function (pi: ExtensionAPI) {
           if (command) ctx.ui.setEditorText(`${command} `);
           return;
         }
+        if (action === "launcher") {
+          const path = (await run(ctx, "install-launcher")).trim();
+          ctx.ui.notify(`${path} готов. Запускайте Pi из проекта командой pi-with-plugins.`, "info");
+          return;
+        }
         if (action === "add") {
           const input = params[0] ?? (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
           if (!input) return;
           ctx.ui.notify("Скачиваю Git-источник…", "info");
           const alias = params[1] ? ["--", params[1]] : [];
           const name = (await run(ctx, "source-add", `--source=${input}`, ...alias)).trim();
-          ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin list, чтобы выбрать плагины.`, "info");
+          ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin personal, чтобы выбрать личные плагины проекта.`, "info");
           return;
         }
 
@@ -139,7 +149,10 @@ export default function (pi: ExtensionAPI) {
         }
 
         const { checkout, plugins, rootPlugin }: Catalog = JSON.parse(await run(ctx, "catalog", ...sourceArgs));
-        const connected = await connectedPlugins(ctx.cwd, checkout);
+        const personal = action === "personal";
+        const connected = personal
+          ? new Set<string>((JSON.parse(await run(ctx, "personal")) as Record<string, string[]>)[sources[alias]] ?? [])
+          : await connectedPlugins(ctx.cwd, checkout);
         const available = new Set(plugins);
         if (rootPlugin) available.add(".");
         const names = [...new Set([...available, ...connected])].sort();
@@ -152,15 +165,22 @@ export default function (pi: ExtensionAPI) {
           `${label(name)} — ${connected.has(name) ? (available.has(name) ? "подключён" : "подключён, убран из поставки") : "доступен"}`,
           name,
         ]));
-        const choice = await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}`, [...options.keys()]);
+        const choice = await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}${personal ? " · лично" : ""}`, [...options.keys()]);
         const plugin = choice ? options.get(choice) : undefined;
         if (!plugin) return;
         const removing = connected.has(plugin);
         const confirmed = await ctx.ui.confirm(
           removing ? `Отключить ${label(plugin)}?` : `Подключить ${label(plugin)}?`,
-          removing ? "Только для текущего проекта." : "Только для текущего проекта. Расширения запускаются с правами Pi.",
+          personal
+            ? "Личный выбор для проекта, без изменений .pi/settings.json. Расширения запускаются с правами Pi."
+            : removing ? "Только для текущего проекта." : "Только для текущего проекта. Расширения запускаются с правами Pi.",
         );
         if (!confirmed) return;
+        if (personal) {
+          await run(ctx, removing ? "personal-remove" : "personal-add", plugin, ...sourceArgs);
+          ctx.ui.notify(`${label(plugin)}: ${removing ? "отключён" : "подключён"} лично. Запустите pi-with-plugins из проекта, чтобы применить выбор.`, "info");
+          return;
+        }
         // The child CLI does not inherit the active session's project-trust decision.
         await run(ctx, removing ? "remove" : "install", plugin, ...sourceArgs, "--approve");
         ctx.ui.notify(`${label(plugin)}: ${removing ? "отключён" : "подключён"} в текущем проекте.`, "info");

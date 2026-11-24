@@ -146,13 +146,97 @@ def add_source(alias, source, checkout):
             return name
 
 
+def project_selections_dir():
+    cwd = Path.cwd()
+    git = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True)
+    root = Path(git.stdout.strip()).resolve() if git.returncode == 0 else cwd
+    key = hashlib.sha256(os.fsencode(root)).hexdigest()
+    return sources_dir().parent / "projects" / key
+
+
+def personal_choices():
+    choices = {}
+    for path in sorted(project_selections_dir().glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(entry, dict):
+            continue
+        source, name = entry.get("source"), entry.get("plugin")
+        if isinstance(source, str) and valid_source(source) and isinstance(name, str) and valid_plugin(name):
+            choices.setdefault(source, []).append(name)
+    return choices
+
+
+def valid_plugin(name):
+    return name == "." or PLUGIN_NAME.fullmatch(name) is not None
+
+
+def save_personal_choice(source, name, enabled):
+    folder = project_selections_dir()
+    identity = json.dumps({"source": source, "plugin": name}, ensure_ascii=False)
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    target = folder / f"{key}.json"
+    if not enabled:
+        target.unlink(missing_ok=True)
+        return
+    checkout = checkout_path(source)
+    ensure_checkout(source, checkout)
+    plugin_path(checkout, name)
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".selection-", dir=folder) as tmp:
+        staged = Path(tmp) / "selection.json"
+        staged.write_text(identity + "\n", encoding="utf-8")
+        staged.replace(target)
+
+
+def install_launcher():
+    target = Path.home() / ".local" / "bin" / "pi-with-plugins"
+    script = Path(__file__).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.symlink_to(script)
+    except FileExistsError:
+        if not target.is_symlink() or target.resolve() != script:
+            raise ValueError(f"{target} уже существует; не перезаписываю") from None
+    return target
+
+
+def launch_pi(args):
+    # Pi takes explicit -e paths for the process lifetime. Never write or approve project config.
+    options = []
+    if not {"-ne", "--no-extensions"}.intersection(args):
+        for source, names in personal_choices().items():
+            checkout = checkout_path(source)
+            for name in names:
+                try:
+                    if not has_checkout(checkout):
+                        raise ValueError("клон недоступен")
+                    plugin = plugin_path(checkout, name)
+                except (OSError, ValueError) as error:
+                    print(f"pi-with-plugins: {inferred_alias(source)}/{name}: {error}", file=sys.stderr)
+                    continue
+                options += ["-e", str(plugin)]
+    os.execvp("pi", ["pi", *options, *args])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    if Path(sys.argv[0]).name == "pi-with-plugins" or sys.argv[1:2] == ["run"]:
+        try:
+            launch_pi(sys.argv[1:] if Path(sys.argv[0]).name == "pi-with-plugins" else sys.argv[2:])
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"pi-with-plugins: {error}\n")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("sources", help="показать сохранённые Git-источники (JSON)")
+    commands.add_parser("personal", help="показать личный выбор для текущего проекта (JSON)")
+    commands.add_parser("install-launcher", help="подключить pi-with-plugins в ~/.local/bin")
+    commands.add_parser("run", help="запустить Pi с личным выбором для проекта")
     for action, help_text in (
         ("install", "скачать поставку при необходимости и подключить плагин здесь"),
         ("remove", "отключить плагин здесь, не удаляя общую копию"),
+        ("personal-add", "подключить плагин лично для текущего проекта"),
+        ("personal-remove", "удалить личное подключение для текущего проекта"),
         ("update", "обновить общую копию поставки для всех проектов"),
         ("source-add", "скачать и сохранить Git-источник под именем"),
         ("catalog", "показать доступные Pi-пакеты в источнике (JSON)"),
@@ -162,16 +246,17 @@ def main():
                              help="Git-адрес поставки (по умолчанию $PI_PLUGINS_SOURCE)")
         if action == "source-add":
             command.add_argument("alias", nargs="?", help="необязательное имя источника в меню /plugin")
-        if action in {"install", "remove"}:
+        if action in {"install", "remove", "personal-add", "personal-remove"}:
             command.add_argument("plugin", help="имя каталога плагина в поставке или . для корневого пакета")
+        if action in {"install", "remove"}:
             command.add_argument("--approve", action="store_true",
                                  help="передать Pi разрешение доверять проекту на эту команду")
     args = parser.parse_args()
-    if args.command != "sources":
+    if args.command not in {"sources", "personal", "install-launcher"}:
         args.source = normalize_source(args.source or "")
         if not valid_source(args.source):
             parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
-    if args.command in {"install", "remove"} and args.plugin != "." and not PLUGIN_NAME.fullmatch(args.plugin):
+    if hasattr(args, "plugin") and not valid_plugin(args.plugin):
         parser.error("недопустимое имя плагина")
     if args.command == "source-add" and args.alias is not None and not PLUGIN_NAME.fullmatch(args.alias):
         parser.error("имя источника: строчные латинские буквы, цифры и дефисы")
@@ -180,9 +265,17 @@ def main():
         if args.command == "sources":
             print(json.dumps(sources()))
             return 0
+        if args.command == "personal":
+            print(json.dumps(personal_choices()))
+            return 0
+        if args.command == "install-launcher":
+            print(install_launcher())
+            return 0
         source = args.source
         checkout = checkout_path(source)
-        if args.command == "source-add":
+        if args.command in {"personal-add", "personal-remove"}:
+            save_personal_choice(source, args.plugin, enabled=args.command == "personal-add")
+        elif args.command == "source-add":
             print(add_source(args.alias, source, checkout))
         elif args.command == "catalog":
             print(json.dumps(catalog(source, checkout)))
