@@ -28,7 +28,12 @@ def xdg_home(variable, fallback):
 def checkout_path(source):
     data_home = xdg_home("XDG_DATA_HOME", ".local/share")
     key = hashlib.sha256(source.encode()).hexdigest()
-    return data_home / "pi-plugins" / "git" / key
+    folder = data_home / "pi-plugins" / "git"
+    legacy = folder / key
+    # Existing `pi install -l` entries refer to the old paths; don't move them.
+    if has_checkout(legacy):
+        return legacy
+    return folder / f"{inferred_alias(source)[:64]}--{key}"
 
 
 def sources_dir():
@@ -208,12 +213,30 @@ def install_launcher():
     return link_launcher(Path.home() / ".local" / "bin" / "pi-with-plugins")
 
 
-def setup_pi():
+def shell_rc():
     shell = Path(os.environ.get("SHELL", "")).name
-    if shell not in {"bash", "zsh"}:
+    if shell == "zsh":
+        return Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc"
+    if shell == "bash":
+        return Path.home() / ".bashrc"
+    return None
+
+
+def launcher_status():
+    rc = shell_rc()
+    if rc is None:
+        return "unsupported"
+    target = sources_dir().parent / "bin" / "pi"
+    if target.is_symlink() and target.resolve() == Path(__file__).resolve() and rc.is_file():
+        if SHELL_MARKER in rc.read_text(encoding="utf-8").splitlines():
+            return "configured"
+    return "needs-setup"
+
+
+def setup_pi():
+    rc = shell_rc()
+    if rc is None:
         raise ValueError("автонастройка поддерживает bash и zsh; для других оболочек используйте /plugin launcher")
-    rc = (Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc" if shell == "zsh"
-          else Path.home() / ".bashrc")
     current = rc.read_text(encoding="utf-8") if rc.exists() else ""
     folder = sources_dir().parent / "bin"
     link_launcher(folder / "pi")
@@ -268,6 +291,7 @@ def main():
     commands.add_parser("personal", help="показать личный выбор для текущего проекта (JSON)")
     commands.add_parser("install-launcher", help="подключить pi-with-plugins в ~/.local/bin")
     commands.add_parser("setup-local", help="подключить личные плагины к команде pi в bash/zsh")
+    commands.add_parser("launcher-status", help="проверить настройку команды pi в текущей оболочке")
     commands.add_parser("run", help="запустить Pi с личным выбором для проекта")
     for action, help_text in (
         ("install", "скачать поставку при необходимости и подключить плагин здесь"),
@@ -289,7 +313,7 @@ def main():
             command.add_argument("--approve", action="store_true",
                                  help="передать Pi разрешение доверять проекту на эту команду")
     args = parser.parse_args()
-    if args.command not in {"sources", "personal", "install-launcher", "setup-local"}:
+    if args.command not in {"sources", "personal", "install-launcher", "setup-local", "launcher-status"}:
         args.source = normalize_source(args.source or "")
         if not valid_source(args.source):
             parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
@@ -310,6 +334,9 @@ def main():
             return 0
         if args.command == "setup-local":
             print(setup_pi())
+            return 0
+        if args.command == "launcher-status":
+            print(launcher_status())
             return 0
         source = args.source
         checkout = checkout_path(source)

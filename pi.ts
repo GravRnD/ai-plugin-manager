@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const script = fileURLToPath(new URL("./scripts/pi-plugins", import.meta.url));
 const extensionPath = fileURLToPath(import.meta.url);
 const actions = {
-  add: "Добавить источник",
+  add: "Скачать и подключить",
   local: "Только для меня",
   list: "Плагины в .pi",
   "setup-local": "Подключить личный список к обычному pi",
@@ -65,6 +65,13 @@ export default function (pi: ExtensionAPI) {
     if (ctx.isProjectTrusted()) await ctx.reload();
   }
 
+  async function setupLocal(ctx: ExtensionCommandContext) {
+    if (!await ctx.ui.confirm("Подключить личные плагины к команде pi?",
+      "Однократно добавим обёртку в PATH через .bashrc или .zshrc. Бинарник Pi и .pi/settings.json не меняются.")) return false;
+    await run(ctx, "setup-local");
+    return true;
+  }
+
   pi.registerCommand("plugin", {
     description: "Плагины Pi",
     getArgumentCompletions: (prefix) => {
@@ -82,7 +89,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const [requested, ...params] = args.trim().split(/\s+/);
         const verb = requested.toLowerCase();
-        let action: Action | "launcher" | undefined = verb === "personal" ? "local" : verb === "launcher" ? "launcher" :
+        let action: Action | "launcher" | undefined = verb === "personal" || verb === "-l" ? "local" : verb === "launcher" ? "launcher" :
           actionNames.find((name) => name === verb);
         if (requested && !action) {
           ctx.ui.notify(`Неизвестное действие: ${requested}. Список: /plugin help.`, "warning");
@@ -106,7 +113,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (action === "help") {
           ctx.ui.notify(["/plugin — открыть меню", ...actionNames.map((name) =>
-            `${name === "add" ? addUsage : `/plugin ${name}`} — ${actions[name]}`)].join("\n"), "info");
+            `${name === "add" ? addUsage : name === "local" ? "/plugin local (или /plugin -l)" : `/plugin ${name}`} — ${actions[name]}`)].join("\n"), "info");
           return;
         }
         if (action === "commands") {
@@ -124,11 +131,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (action === "setup-local") {
-          const confirmed = await ctx.ui.confirm("Подключить личные плагины к команде pi?",
-            "Добавим путь к обёртке в .bashrc или .zshrc. Бинарник Pi и .pi/settings.json не меняются.");
-          if (!confirmed) return;
-          await run(ctx, "setup-local");
-          ctx.ui.notify("Готово. Откройте новый терминал и запускайте обычный pi.", "info");
+          if (await setupLocal(ctx)) ctx.ui.notify("Готово. Откройте новый терминал и запускайте обычный pi.", "info");
           return;
         }
         if (action === "launcher") {
@@ -136,26 +139,28 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`${path} готов. Запускайте Pi из проекта командой pi-with-plugins.`, "info");
           return;
         }
-        if (action === "add") {
-          const input = params[0] ?? (await ctx.ui.input("Git-адрес поставки", "git@host:team/tools.git"))?.trim();
+        const adding = action === "add";
+        let alias: string | undefined;
+        if (adding) {
+          const input = params[0] ?? (await ctx.ui.input("Git-адрес поставки", "git@github.com:team/tools.git"))?.trim();
           if (!input) return;
           ctx.ui.notify("Скачиваю Git-источник…", "info");
-          const alias = params[1] ? ["--", params[1]] : [];
-          const name = (await run(ctx, "source-add", `--source=${input}`, ...alias)).trim();
-          ctx.ui.notify(`Источник ${name} добавлен. Выбор плагинов: /plugin local.`, "info");
-          return;
+          const nameArgs = params[1] ? ["--", params[1]] : [];
+          alias = (await run(ctx, "source-add", `--source=${input}`, ...nameArgs)).trim();
+          const registered: Record<string, string> = JSON.parse(await run(ctx, "sources"));
+          sources[alias] = registered[alias];
+        } else {
+          if (!aliases.length) {
+            ctx.ui.notify("Нет Git-источников. Добавьте первый через /plugin add.", "info");
+            return;
+          }
+          if (action === "list" && !ctx.isProjectTrusted()) {
+            ctx.ui.notify("Чтобы изменить плагины проекта, сначала разрешите его настройки через /trust.", "warning");
+            return;
+          }
+          alias = aliases.length === 1 ? aliases[0] : await ctx.ui.select("Выберите Git-источник", aliases);
+          if (!alias) return;
         }
-
-        if (!aliases.length) {
-          ctx.ui.notify("Нет Git-источников. Добавьте первый через /plugin add.", "info");
-          return;
-        }
-        if (action === "list" && !ctx.isProjectTrusted()) {
-          ctx.ui.notify("Чтобы изменить плагины проекта, сначала разрешите его настройки через /trust.", "warning");
-          return;
-        }
-        const alias = aliases.length === 1 ? aliases[0] : await ctx.ui.select("Выберите Git-источник", aliases);
-        if (!alias) return;
         const sourceArgs = ["--source", sources[alias]];
         if (action === "update") {
           await updateSource(ctx, alias, sourceArgs);
@@ -163,7 +168,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const { checkout, plugins, rootPlugin }: Catalog = JSON.parse(await run(ctx, "catalog", ...sourceArgs));
-        const personal = action === "local";
+        const personal = adding || action === "local";
         const connected = personal
           ? new Set<string>((JSON.parse(await run(ctx, "personal")) as Record<string, string[]>)[sources[alias]] ?? [])
           : await connectedPlugins(ctx.cwd, checkout);
@@ -179,8 +184,8 @@ export default function (pi: ExtensionAPI) {
           `${label(name)} — ${connected.has(name) ? (available.has(name) ? "установлен" : "нет в источнике") : "доступен"}`,
           name,
         ]));
-        const choice = await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}${personal ? " · лично" : ""}`, [...options.keys()]);
-        const plugin = choice ? options.get(choice) : undefined;
+        const plugin = adding && names.length === 1 && !connected.has(names[0]) ? names[0] :
+          options.get(await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}${personal ? " · лично" : ""}`, [...options.keys()]) ?? "");
         if (!plugin) return;
         const name = label(plugin);
         const installed = connected.has(plugin);
@@ -196,8 +201,20 @@ export default function (pi: ExtensionAPI) {
         }
         const notice = `${installed ? "Удалено" : "Установлено"}: ${name}.`;
         if (personal) {
+          let next = "Перезапустите обычный pi.";
+          if (!installed) {
+            const status = (await run(ctx, "launcher-status")).trim();
+            if (status === "needs-setup") {
+              next = await setupLocal(ctx) ? "Откройте новый терминал и запустите обычный pi." :
+                "Для запуска обычным pi выполните /plugin setup-local.";
+            } else if (status === "configured") {
+              next = "Запустите обычный pi заново (в новом терминале, если он открыт до настройки).";
+            } else {
+              next = "Для этой оболочки подключите /plugin launcher или настройте обёртку в bash/zsh.";
+            }
+          }
           await run(ctx, installed ? "personal-remove" : "personal-add", plugin, ...sourceArgs);
-          ctx.ui.notify(`${notice} Перезапустите Pi. Первичная настройка: /plugin setup-local.`, "info");
+          ctx.ui.notify(`${notice} ${next}`, "info");
           return;
         }
         // The child CLI does not inherit the active session's project-trust decision.
