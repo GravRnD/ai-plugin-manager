@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from pathlib import Path
 
 PLUGIN_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SCP_SOURCE = re.compile(r"(?:[\w.-]+@)?[\w.-]+:[^:\s][^\s]*")
+PI_MANAGEMENT = {"install", "remove", "uninstall", "update", "list", "config", "auth", "mcp", "-h", "--help", "-v", "--version"}
+SHELL_MARKER = "# >>> ai-plugin-manager: local Pi >>>"
 
 
 def xdg_home(variable, fallback):
@@ -190,8 +193,7 @@ def save_personal_choice(source, name, enabled):
         staged.replace(target)
 
 
-def install_launcher():
-    target = Path.home() / ".local" / "bin" / "pi-with-plugins"
+def link_launcher(target):
     script = Path(__file__).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -202,10 +204,42 @@ def install_launcher():
     return target
 
 
+def install_launcher():
+    return link_launcher(Path.home() / ".local" / "bin" / "pi-with-plugins")
+
+
+def setup_pi():
+    shell = Path(os.environ.get("SHELL", "")).name
+    if shell not in {"bash", "zsh"}:
+        raise ValueError("автонастройка поддерживает bash и zsh; для других оболочек используйте /plugin launcher")
+    rc = (Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc" if shell == "zsh"
+          else Path.home() / ".bashrc")
+    current = rc.read_text(encoding="utf-8") if rc.exists() else ""
+    folder = sources_dir().parent / "bin"
+    link_launcher(folder / "pi")
+    if SHELL_MARKER not in current.splitlines():
+        quoted = shlex.quote(str(folder))
+        block = (f"\n{SHELL_MARKER}\n"
+                 f"case \"$PATH\" in {quoted}:*) ;; *) export PATH={quoted}:\"$PATH\" ;; esac\n"
+                 "# <<< ai-plugin-manager: local Pi <<<\n")
+        with rc.open("a", encoding="utf-8") as out:
+            out.write(block)
+    return rc
+
+
+def real_pi():
+    script = Path(__file__).resolve()
+    for directory in os.get_exec_path():
+        target = Path(directory) / "pi"
+        if target.is_file() and os.access(target, os.X_OK) and target.resolve() != script:
+            return target.absolute()
+    raise FileNotFoundError("не найден исполняемый файл Pi вне обёртки")
+
+
 def launch_pi(args):
     # Pi takes explicit -e paths for the process lifetime. Never write or approve project config.
     options = []
-    if not {"-ne", "--no-extensions"}.intersection(args):
+    if not (args and args[0] in PI_MANAGEMENT) and not {"-ne", "--no-extensions"}.intersection(args):
         for source, names in personal_choices().items():
             checkout = checkout_path(source)
             for name in names:
@@ -217,20 +251,23 @@ def launch_pi(args):
                     print(f"pi-with-plugins: {inferred_alias(source)}/{name}: {error}", file=sys.stderr)
                     continue
                 options += ["-e", str(plugin)]
-    os.execvp("pi", ["pi", *options, *args])
+    executable = real_pi()
+    os.execv(str(executable), [str(executable), *options, *args])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    if Path(sys.argv[0]).name == "pi-with-plugins" or sys.argv[1:2] == ["run"]:
+    direct = Path(sys.argv[0]).name in {"pi", "pi-with-plugins"}
+    if direct or sys.argv[1:2] == ["run"]:
         try:
-            launch_pi(sys.argv[1:] if Path(sys.argv[0]).name == "pi-with-plugins" else sys.argv[2:])
+            launch_pi(sys.argv[1:] if direct else sys.argv[2:])
         except (OSError, ValueError) as error:
             parser.exit(1, f"pi-with-plugins: {error}\n")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("sources", help="показать сохранённые Git-источники (JSON)")
     commands.add_parser("personal", help="показать личный выбор для текущего проекта (JSON)")
     commands.add_parser("install-launcher", help="подключить pi-with-plugins в ~/.local/bin")
+    commands.add_parser("setup-local", help="подключить личные плагины к команде pi в bash/zsh")
     commands.add_parser("run", help="запустить Pi с личным выбором для проекта")
     for action, help_text in (
         ("install", "скачать поставку при необходимости и подключить плагин здесь"),
@@ -252,7 +289,7 @@ def main():
             command.add_argument("--approve", action="store_true",
                                  help="передать Pi разрешение доверять проекту на эту команду")
     args = parser.parse_args()
-    if args.command not in {"sources", "personal", "install-launcher"}:
+    if args.command not in {"sources", "personal", "install-launcher", "setup-local"}:
         args.source = normalize_source(args.source or "")
         if not valid_source(args.source):
             parser.error("укажите --source или PI_PLUGINS_SOURCE: адрес SSH/HTTPS либо абсолютный путь")
@@ -270,6 +307,9 @@ def main():
             return 0
         if args.command == "install-launcher":
             print(install_launcher())
+            return 0
+        if args.command == "setup-local":
+            print(setup_pi())
             return 0
         source = args.source
         checkout = checkout_path(source)

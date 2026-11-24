@@ -8,9 +8,9 @@ const script = fileURLToPath(new URL("./scripts/pi-plugins", import.meta.url));
 const extensionPath = fileURLToPath(import.meta.url);
 const actions = {
   add: "Добавить источник",
-  personal: "Личные плагины",
+  local: "Только для меня",
   list: "Плагины в .pi",
-  launcher: "Настроить запуск",
+  "setup-local": "Подключить личный список к обычному pi",
   update: "Обновить источник",
   commands: "Команды",
   help: "Справка",
@@ -81,7 +81,9 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         const [requested, ...params] = args.trim().split(/\s+/);
-        let action = actionNames.find((name) => name === requested.toLowerCase());
+        const verb = requested.toLowerCase();
+        let action: Action | "launcher" | undefined = verb === "personal" ? "local" : verb === "launcher" ? "launcher" :
+          actionNames.find((name) => name === verb);
         if (requested && !action) {
           ctx.ui.notify(`Неизвестное действие: ${requested}. Список: /plugin help.`, "warning");
           return;
@@ -91,13 +93,13 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         // Help and command discovery use the current session, not the Git catalog.
-        const sources: Record<string, string> = action === "help" || action === "commands" || action === "launcher"
+        const sources: Record<string, string> = action === "help" || action === "commands" || action === "launcher" || action === "setup-local"
           ? {} : JSON.parse(await run(ctx, "sources"));
         const aliases = Object.keys(sources).sort();
         if (!action) {
           const menu: Action[] = aliases.length
-            ? ["personal", "update", "add", "commands", "launcher", "list", "help"]
-            : ["add", "commands", "launcher", "help"];
+            ? ["local", "update", "add", "commands", "list", "help"]
+            : ["add", "commands", "help"];
           const selected = await ctx.ui.select("Плагины Pi", menu.map((name) => actions[name]));
           action = menu.find((name) => actions[name] === selected);
           if (!action) return;
@@ -121,6 +123,14 @@ export default function (pi: ExtensionAPI) {
           if (command) ctx.ui.setEditorText(`${command} `);
           return;
         }
+        if (action === "setup-local") {
+          const confirmed = await ctx.ui.confirm("Подключить личные плагины к команде pi?",
+            "Добавим путь к обёртке в .bashrc или .zshrc. Бинарник Pi и .pi/settings.json не меняются.");
+          if (!confirmed) return;
+          await run(ctx, "setup-local");
+          ctx.ui.notify("Готово. Откройте новый терминал и запускайте обычный pi.", "info");
+          return;
+        }
         if (action === "launcher") {
           const path = (await run(ctx, "install-launcher")).trim();
           ctx.ui.notify(`${path} готов. Запускайте Pi из проекта командой pi-with-plugins.`, "info");
@@ -132,7 +142,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Скачиваю Git-источник…", "info");
           const alias = params[1] ? ["--", params[1]] : [];
           const name = (await run(ctx, "source-add", `--source=${input}`, ...alias)).trim();
-          ctx.ui.notify(`Источник ${name} добавлен. Выбор плагинов: /plugin personal.`, "info");
+          ctx.ui.notify(`Источник ${name} добавлен. Выбор плагинов: /plugin local.`, "info");
           return;
         }
 
@@ -153,7 +163,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const { checkout, plugins, rootPlugin }: Catalog = JSON.parse(await run(ctx, "catalog", ...sourceArgs));
-        const personal = action === "personal";
+        const personal = action === "local";
         const connected = personal
           ? new Set<string>((JSON.parse(await run(ctx, "personal")) as Record<string, string[]>)[sources[alias]] ?? [])
           : await connectedPlugins(ctx.cwd, checkout);
@@ -187,7 +197,7 @@ export default function (pi: ExtensionAPI) {
         const notice = `${installed ? "Удалено" : "Установлено"}: ${name}.`;
         if (personal) {
           await run(ctx, installed ? "personal-remove" : "personal-add", plugin, ...sourceArgs);
-          ctx.ui.notify(`${notice} Перезапустите pi-with-plugins.`, "info");
+          ctx.ui.notify(`${notice} Перезапустите Pi. Первичная настройка: /plugin setup-local.`, "info");
           return;
         }
         // The child CLI does not inherit the active session's project-trust decision.
