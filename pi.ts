@@ -7,13 +7,13 @@ import { fileURLToPath } from "node:url";
 const script = fileURLToPath(new URL("./scripts/pi-plugins", import.meta.url));
 const extensionPath = fileURLToPath(import.meta.url);
 const actions = {
-  add: "Добавить Git-источник",
-  personal: "Личные плагины проекта (вне репозитория)",
-  list: "Плагины проекта (.pi/settings.json)",
-  launcher: "Подключить запуск pi-with-plugins",
-  update: "Обновить Git-источник",
-  commands: "Команды подключённых пакетов",
-  help: "Справка по /plugin",
+  add: "Добавить источник",
+  personal: "Личные плагины",
+  list: "Плагины в .pi",
+  launcher: "Настроить запуск",
+  update: "Обновить источник",
+  commands: "Команды",
+  help: "Справка",
 };
 type Action = keyof typeof actions;
 const actionNames = Object.keys(actions) as Action[];
@@ -58,8 +58,15 @@ export default function (pi: ExtensionAPI) {
     return result.stdout;
   }
 
+  async function updateSource(ctx: ExtensionCommandContext, name: string, sourceArgs: string[]) {
+    ctx.ui.notify(`Обновляю ${name}…`, "info");
+    await run(ctx, "update", ...sourceArgs);
+    ctx.ui.notify(`Обновлено: ${name}.`, "info");
+    if (ctx.isProjectTrusted()) await ctx.reload();
+  }
+
   pi.registerCommand("plugin", {
-    description: "Меню плагинов Pi · add, personal, list, launcher, update, commands, help",
+    description: "Плагины Pi",
     getArgumentCompletions: (prefix) => {
       const matches = actionNames.filter((name) => name.startsWith(prefix.trimStart().toLowerCase()));
       return matches.length ? matches.map((name) => ({
@@ -125,7 +132,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Скачиваю Git-источник…", "info");
           const alias = params[1] ? ["--", params[1]] : [];
           const name = (await run(ctx, "source-add", `--source=${input}`, ...alias)).trim();
-          ctx.ui.notify(`Источник ${name} добавлен. Откройте /plugin personal, чтобы выбрать личные плагины проекта.`, "info");
+          ctx.ui.notify(`Источник ${name} добавлен. Выбор плагинов: /plugin personal.`, "info");
           return;
         }
 
@@ -141,10 +148,7 @@ export default function (pi: ExtensionAPI) {
         if (!alias) return;
         const sourceArgs = ["--source", sources[alias]];
         if (action === "update") {
-          ctx.ui.notify(`Обновляю ${alias}…`, "info");
-          await run(ctx, "update", ...sourceArgs);
-          ctx.ui.notify(`${alias} обновлён. В других открытых проектах используйте /reload.`, "info");
-          if (ctx.isProjectTrusted()) await ctx.reload();
+          await updateSource(ctx, alias, sourceArgs);
           return;
         }
 
@@ -162,28 +166,33 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const options = new Map(names.map((name) => [
-          `${label(name)} — ${connected.has(name) ? (available.has(name) ? "подключён" : "подключён, убран из поставки") : "доступен"}`,
+          `${label(name)} — ${connected.has(name) ? (available.has(name) ? "установлен" : "нет в источнике") : "доступен"}`,
           name,
         ]));
         const choice = await ctx.ui.select(`${alias} · ${basename(ctx.cwd)}${personal ? " · лично" : ""}`, [...options.keys()]);
         const plugin = choice ? options.get(choice) : undefined;
         if (!plugin) return;
-        const removing = connected.has(plugin);
-        const confirmed = await ctx.ui.confirm(
-          removing ? `Отключить ${label(plugin)}?` : `Подключить ${label(plugin)}?`,
-          personal
-            ? "Личный выбор для проекта, без изменений .pi/settings.json. Расширения запускаются с правами Pi."
-            : removing ? "Только для текущего проекта." : "Только для текущего проекта. Расширения запускаются с правами Pi.",
-        );
-        if (!confirmed) return;
+        const name = label(plugin);
+        const installed = connected.has(plugin);
+        if (installed) {
+          const action = await ctx.ui.select(name, ["Обновить", "Удалить"]);
+          if (action === "Обновить") {
+            await updateSource(ctx, name, sourceArgs);
+            return;
+          }
+          if (action !== "Удалить") return;
+        } else if (!await ctx.ui.confirm(`Установить ${name}?`, "Код плагина запускается с правами Pi.")) {
+          return;
+        }
+        const notice = `${installed ? "Удалено" : "Установлено"}: ${name}.`;
         if (personal) {
-          await run(ctx, removing ? "personal-remove" : "personal-add", plugin, ...sourceArgs);
-          ctx.ui.notify(`${label(plugin)}: ${removing ? "отключён" : "подключён"} лично. Запустите pi-with-plugins из проекта, чтобы применить выбор.`, "info");
+          await run(ctx, installed ? "personal-remove" : "personal-add", plugin, ...sourceArgs);
+          ctx.ui.notify(`${notice} Перезапустите pi-with-plugins.`, "info");
           return;
         }
         // The child CLI does not inherit the active session's project-trust decision.
-        await run(ctx, removing ? "remove" : "install", plugin, ...sourceArgs, "--approve");
-        ctx.ui.notify(`${label(plugin)}: ${removing ? "отключён" : "подключён"} в текущем проекте.`, "info");
+        await run(ctx, installed ? "remove" : "install", plugin, ...sourceArgs, "--approve");
+        ctx.ui.notify(notice, "info");
         await ctx.reload();
       } catch (error) {
         ctx.ui.notify(`/plugin: ${error instanceof Error ? error.message : String(error)}`, "error");
